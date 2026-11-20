@@ -66,7 +66,7 @@ rpkit has four parts. Only one of them is a service.
 |---|---|---|
 | `rpkit-core` | Rust library | Builds and signs requests, verifies proofs of every type, defines the storage and signing interfaces. |
 | `rpkit-server` | Service (container image, Helm chart) | Runs `rpkit-core` behind an HTTP API. It owns transactions, nonce and nullifier state, keys, registration and billing. |
-| `@rpkit/widget` | Frontend component | Shows the QR code or deep link, encrypts the request for the bridge, and hands the response back. It holds no secrets. |
+| `@rpkit/widget` | Frontend component | Shows the pairing QR code or deep link and the transaction status. It holds no secrets and does no cryptography. |
 | Edge helpers | Small libraries (TypeScript, Go, Python) | Verify the signed result JWT and webhook signatures that `rpkit-server` emits. |
 
 ```mermaid
@@ -87,7 +87,8 @@ flowchart LR
   S --> DB
   S --> K
   S -->|eth_call, register, billing| C
-  W <-->|encrypted request and response| BR
+  S <-->|WIP-110 encrypted channel| BR
+  W -.->|status| S
   A <--> BR
 ```
 
@@ -237,9 +238,9 @@ In service mode each proof request is a transaction:
 | `rp_id`, `action`, `proof_type` | What is being asked. |
 | `request` | The signed `ProofRequest`. |
 | `nonce` | The request's nonce. |
-| `bridge_key` | The symmetric key that encrypts the bridge payload. |
-| `status` | `created` → `completed` or `failed` or `expired`. |
-| `response_code` | One-time code the RP backend exchanges for the result. |
+| `bridge_session` | The bridge host, session id, seat token, pairing secret and handshake keys. Deleted when the transaction ends. |
+| `status_token` | A random token that lets the widget read this transaction's status, and nothing else. |
+| `status` | `created` → `paired` → `completed`, or `failed` or `expired`. |
 | `result` | The verified result or the failure class. |
 | `expires_at` | Equal to the request's `expires_at`. |
 
@@ -302,53 +303,120 @@ rpkit will serve and publish that record once the format is specified. Until the
 
 ## 9. Transport
 
-### 9.1 Cross-device: QR code and bridge
+rpkit carries requests and responses over the World ID Message Bridge, as specified in [WIP-110](https://github.com/worldcoin/world-id-protocol/pull/1117) (draft). WIP-110 is a generic end-to-end encrypted channel between two parties over an untrusted relay:
 
-1. The RP backend creates a transaction. rpkit returns the signed request and a fresh bridge key.
-2. The widget encrypts the request with AES-256-GCM and posts it to the bridge, which returns a request id.
-3. The widget shows a QR code or deep link containing the request id and the key.
-4. The authenticator fetches the request, asks the user for consent, generates the proof, and puts the encrypted response on the bridge.
-5. The widget polls the bridge, decrypts the response and submits it to rpkit with the `tx_id`.
-6. rpkit verifies the proof (§5) and returns a one-time `response_code`.
-7. The RP backend exchanges the `response_code` for the signed result.
+- **Pairing:** the party that creates the session (the **Initiator**) shows a pairing link containing a random secret `s` and the session's bridge host `b`. The other party (the **Responder**) opens it and joins.
+- **Handshake:** the two parties run a three-message handshake combining X-Wing (post-quantum) key exchange with a key derived from `s`.
+- **Records:** application messages then travel as ChaCha20-Poly1305 encrypted records.
+
+The bridge sees only metadata and cannot read or forge messages.
+
+### 9.1 Roles
+
+**rpkit-server is the Initiator; the authenticator (World App) is the Responder.** The browser never takes part in the channel. The widget only shows the pairing link and the transaction status.
+
+Putting the Initiator on the server has three effects:
+
+- **The proof goes straight to rpkit.** It never passes through the browser, so a tampered page cannot fake, swap or withhold a result.
+- **No secrets or cryptography in the frontend.** The widget is a display component.
+- **No browser needed.** RPs without a browser, such as a backend service, a kiosk or a call bot, use the same flow: they show the pairing link however they can (QR code, deep link, message).
+
+The cost: rpkit holds one long-poll per open transaction (WIP-110 caps a poll at 30 seconds and a session at one hour). The server limits the number of open transactions and sheds new ones with `503` when it is full.
+
+### 9.2 Flow
+
+1. The RP backend creates a transaction (`POST /v1/tx`).
+2. rpkit mints the nonce and signs the `ProofRequest` (§6). It then generates the WIP-110 secrets: the pairing secret `s`, its seat token and an X-Wing key pair.
+3. rpkit creates a bridge session, sends handshake message 1, and returns the pairing URI to the RP backend.
+4. The widget shows the pairing URI as a QR code, or as a deep link on mobile.
+5. The authenticator opens the URI, joins the session and completes the handshake.
+6. rpkit sends the signed `ProofRequest` as a record.
+7. The authenticator shows the consent screen and generates the proof. It sends the `ProofResponse` as a record, or an error record if the user declines.
+8. rpkit verifies the response (§5), leaves the session and deletes all session secrets.
+9. The RP backend fetches the signed result (`GET /v1/tx/{id}`). The widget learns the outcome from the status stream.
 
 ```mermaid
 sequenceDiagram
   participant U as Browser + widget
   participant B as RP backend
-  participant S as rpkit-server
+  participant S as rpkit-server (Initiator)
   participant BR as Bridge
-  participant A as Authenticator
+  participant A as Authenticator (Responder)
   participant C as World Chain
   U->>B: start
   B->>S: POST /v1/tx
-  S->>S: mint nonce, sign request, store transaction
-  S-->>B: tx_id, signed request, bridge key
-  B-->>U: transaction
-  U->>BR: encrypted request
-  U->>U: show QR code
-  A->>BR: fetch request
+  S->>S: mint nonce, sign request, generate s, seat token, X-Wing keys
+  S->>BR: create session, handshake message 1
+  S-->>B: tx_id, pairing URI, status token
+  B-->>U: pairing URI, status token
+  U->>U: show QR code, subscribe to status
+  A->>BR: join with s, handshake messages 2 and 3
+  S->>BR: record: signed ProofRequest
   A->>A: consent, generate proof
-  A->>BR: encrypted response
-  U->>BR: poll, then decrypt
-  U->>S: response + tx_id
+  A->>BR: record: ProofResponse
+  BR-->>S: ProofResponse
   S->>C: chain checks (eth_call)
   S->>S: type checks, consume nonce, record nullifier
-  S-->>U: response_code
-  U->>B: response_code
-  B->>S: POST /v1/tx/{id}/exchange
+  S->>BR: leave session
+  S-->>U: status: completed
+  B->>S: GET /v1/tx/{id}
   S-->>B: signed result JWT
 ```
 
-The result only reaches the RP backend through the code exchange, so a page that tampers with the browser cannot fake a result.
+### 9.3 World ID proof profile
 
-The RP backend MUST link each `tx_id` to the user session that created it, and accept an exchanged result only within that session. This blocks session-swap phishing, where an attacker gets a victim to complete the attacker's transaction. This follows the `response_code` pattern of [OpenID4VP 1.0](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html) and [HAIP](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html).
+WIP-110 leaves several choices to each application. The World ID proof request profile that fixes them is not yet specified. Until it is, rpkit uses the values below and treats them as provisional:
 
-### 9.2 Same device
+| Choice | Provisional value |
+|---|---|
+| Pairing URI | `https://world.org/verify#s=…&b=…&d=…`. Parameters go in the fragment so they never reach a web server. A `worldid://` deep link carries the same parameters. |
+| Authentication mode | `psk`: possession of the pairing URI authenticates the authenticator. `code` mode (a 6-letter code typed into World App) is a per-RP option for high-value flows. |
+| `app_label` | `worldid/rp/v1/proof` |
+| `app_context` | `d`: SHA-256 of the signed `ProofRequest`, also carried in the URI. The authenticator rejects a request record whose digest differs, so a malicious bridge cannot substitute a request even before the handshake completes. |
+| Records | Initiator: one `ProofRequest`. Responder: one `ProofResponse` or one error. Either side leaves after that. |
+| Session `ttl` | The request lifetime (§6.1), so the channel and the request expire together. |
 
-Inside World App, the widget hands the request to the app directly instead of using the bridge. Everything after step 5 is the same.
+rpkit will follow the profile once it is published and expose the WIP-110 handshake version in its metrics.
 
-### 9.3 Later: OpenID4VP and the Digital Credentials API
+### 9.4 Binding the result to the right user
+
+The RP backend MUST link each `tx_id` to the user session that created it, and accept a result only within that session.
+
+One attack remains that no cross-device flow can fully prevent. An attacker starts a transaction in their own session and gets a victim to scan the attacker's QR code, which attaches the victim's proof to the attacker's account. This is the cross-device phishing described in the [IETF cross-device security BCP](https://datatracker.ietf.org/doc/draft-ietf-oauth-cross-device-security/).
+
+Mitigations:
+
+- World App's consent screen shows the RP's verified domain (§8).
+- Transactions are short-lived.
+- Same-device flows (§9.5) are preferred where the user is already on their phone.
+
+### 9.5 Same device
+
+- **Mobile browser:** the widget opens the pairing URI as a deep link. World App joins the session exactly as in §9.2 and returns the user to the page afterwards (`return_to`).
+- **Inside World App:** a page running inside World App passes the signed request to the app through its native interface and receives the `ProofResponse` back. The page hands the response to the RP backend, which submits it with `POST /v1/tx/{id}/response`. Verification is the same as in §9.2 steps 8–9.
+
+### 9.6 Bridge hosts
+
+WIP-110 requires the authenticator to check the bridge host `b` against an allowlist. An RP can run its own bridge only once authenticators accept its host. Until then, rpkit uses the public World ID bridge.
+
+The bridge's errors map onto rpkit's error classes:
+
+| Bridge error | rpkit's response |
+|---|---|
+| `rate_limited`, `unavailable` | Retry with backoff, honoring `Retry-After`, within the transaction's deadline |
+| `seat_taken` | The pairing link was claimed by another device: the transaction fails with `pairing_hijacked` and the widget tells the user |
+| `not_found`, `forbidden`, `conflict` | The transaction fails |
+
+### 9.7 Legacy bridge
+
+World App today speaks the earlier bridge protocol:
+
+- a single AES-256-GCM key sent in the link's query string
+- `POST /request`, then polling `GET /response/{id}`.
+
+Until World App supports WIP-110 for proof requests, rpkit also implements the legacy bridge, using the same server-side Initiator model: rpkit generates the key, posts the request and polls for the response. The RP API and the widget are the same for both transports; the transport is chosen in configuration. Legacy support will be removed once WIP-110 is deployed in World App.
+
+### 9.8 Later: OpenID4VP and the Digital Credentials API
 
 A later version adds an OpenID4VP profile over the browser [Digital Credentials API](https://www.w3.org/TR/digital-credentials/), with the registry acting as the verifier's trust anchor. The bridge stays the default until browsers and authenticators support that profile.
 
@@ -362,19 +430,25 @@ Authenticated. In sidecar deployments it is bound to localhost; shared deploymen
 
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/tx` | Create a transaction for `{ rp_id, proof_type, action, signal, credentials, constraints }`. Returns `{ tx_id, request, bridge_key, expires_at }`. |
-| `GET /v1/tx/{id}` | Transaction status. |
+| `POST /v1/tx` | Create a transaction for `{ rp_id, proof_type, action, signal, credentials, constraints }`. Returns `{ tx_id, pairing_uri, status_token, expires_at }`. |
+| `GET /v1/tx/{id}` | Transaction status and, once completed, the signed result JWT. |
 | `GET /v1/tx/{id}/events` | Server-sent events for status changes. A late subscriber receives the current state first. |
-| `POST /v1/tx/{id}/exchange` | Exchange a `response_code` for the signed result JWT. One-time. |
+| `POST /v1/tx/{id}/response` | Submit a `ProofResponse` received outside the bridge, as in the in-app flow (§9.5). |
 | `POST /v1/verify` | Stateless verification of `{ request, response }` for RPs that keep their own nonce and nullifier state. Runs §5.2 steps 1–3 only. |
 
-### 10.2 Wallet-facing API
+### 10.2 Public API
 
-Public. It receives the response from the widget (`POST /v1/tx/{id}/response`) and, later, OpenID4VP `request_uri` and `direct_post` endpoints.
+The only public endpoint is `GET /v1/public/tx/{id}/events?token=<status_token>`.
+
+- It streams status changes as server-sent events: `created`, `paired`, `completed`, `failed`, `expired`.
+- It never returns the result or any proof data.
+- The RP exposes it to browsers directly or proxies it through its backend; the RP API stays private either way.
+
+Later versions add the OpenID4VP `request_uri` and `direct_post` endpoints here.
 
 ### 10.3 Results
 
-On success the exchange returns a JWT signed with ES256:
+A completed transaction's result is a JWT signed with ES256:
 
 - **Claims:** `iss`, `aud` (the RP), `iat`, `exp`, `tx_id`, `rp_id`, `proof_type`, `action` where present, `session_id` where present, and per response item `issuer_schema_id` and `nullifier` where the proof type has one.
 - **Keys:** published at `/.well-known/jwks.json`. A new key is added before use, the newest key signs, and an old key is retired after the longest token lifetime has passed.
@@ -402,7 +476,7 @@ What each outside party learns from a verification:
 |---|---|
 | TFH / Developer Portal | Nothing on the verification path. The portal only serves consent metadata until the domain-verified record is supported (§15). |
 | World Chain RPC provider | The `eth_call` inputs: `rp_id`, nullifier, action, nonce, signal hash and timing. Run your own World Chain node, or use a provider you trust with this. |
-| Bridge operator | Encrypted payloads, request ids, timing and client IP addresses. |
+| Bridge operator | Session ids, message sizes, timing and IP addresses, of the rpkit server and of the user's device (WIP-110 §4). |
 
 rpkit sends no telemetry to anyone. Its metrics and logs never contain nullifiers, signals or session ids.
 
@@ -471,7 +545,10 @@ These are versioned independently:
 
 ## 15. Known limitations
 
-- **Bridge.** World App currently accepts only World-operated bridge domains, so rpkit uses the public bridge until authenticators accept other bridges.
+- **Bridge.**
+  - World App speaks only the legacy bridge today, so rpkit supports it until WIP-110 is deployed (§9.7).
+  - Authenticators accept only allowlisted bridge hosts, so RPs use the public bridge (§9.6).
+  - The World ID proof profile for WIP-110 is not yet specified (§9.3).
 - **Consent metadata.** World App currently reads the RP's name and logo from the Developer Portal. Until the domain-verified record (§8) is supported, an RP needs a Developer Portal entry for display purposes, even though verification no longer goes through it.
 - **Legacy proofs.** World ID v3 proofs can only be verified by TFH's sequencer, so rpkit does not support them.
 
@@ -480,6 +557,6 @@ These are versioned independently:
 | Phase | Scope |
 |---|---|
 | 0 | `rpkit-core` with the `uniqueness`, `session` and `embedding_similarity` verifiers; stateless `POST /v1/verify`; container image. |
-| 1 | Transactions, nonce and nullifier stores, KMS signer, result JWT, registration, billing, Helm chart. |
+| 1 | Transactions, WIP-110 and legacy bridge transports, nonce and nullifier stores, KMS signer, result JWT, registration, billing, Helm chart. |
 | 2 | `@rpkit/widget`, edge helpers, domain-verified metadata, request signature `0x02`. |
 | 3 | OpenID4VP / Digital Credentials API profile, conformance test vectors, external audit. |
