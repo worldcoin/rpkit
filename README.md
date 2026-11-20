@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/rpkit-logo-dark.svg">
+    <img src="assets/rpkit-logo-light.svg" alt="rpkit" height="72">
+  </picture>
+</p>
+
 # rpkit
 
 A self-hostable relying-party implementation for [World ID](https://docs.world.org/world-id).
