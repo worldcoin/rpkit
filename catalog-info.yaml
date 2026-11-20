@@ -1,0 +1,19 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  annotations:
+    github.com/project-slug: worldcoin/rpkit
+  tags: ['code-lang:rust']
+  description: World ID RP proof verification library and sidecar.
+  links:
+    - title: Linear
+      url: PLACEHOLDER-ADD-LINEAR-URL
+    - title: Documentation
+      url: PLACEHOLDER-ADD-DOCUMENTATION-URL
+    - title: Slack
+      url: PLACEHOLDER-ADD-SLACK-URL
+  name: rpkit
+spec:
+  lifecycle: experimental
+  owner: team-protocol
+  type: library
