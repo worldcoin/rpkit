@@ -13,11 +13,12 @@ Today a World ID RP depends on two pieces of TFH-run software:
 - **IDKit** builds requests in the RP's frontend, shows the QR code and polls the bridge for the answer.
 - **The Developer Portal** registers the RP on-chain, verifies proofs and serves the RP's name and logo to World App.
 
-That has three costs:
+That has four costs:
 
-- RPs must trust and depend on a hosted service for a decision that the protocol could make on its own.
-- Important guarantees fall between components and nobody enforces them: a nonce is used once, a nullifier is used once.
-- Each new proof type needs work in several places before RPs can use it.
+- **Dependency.** RPs must trust and depend on a hosted service for a decision that the protocol could make on its own.
+- **Privacy.** The hosted service sees every verification: which RP, which action, when, the nullifiers and the signals. That gives it a usage record for every RP and every user interaction, which the protocol itself never needs.
+- **Gaps.** Important guarantees fall between components and nobody enforces them: a nonce is used once, a nullifier is used once.
+- **Speed.** Each new proof type needs work in several places before RPs can use it.
 
 rpkit moves everything an RP needs into one open-source stack the RP runs itself. The protocol's on-chain contracts remain the source of truth.
 
@@ -26,6 +27,7 @@ rpkit moves everything an RP needs into one open-source stack the RP runs itself
 ### Goals
 
 - **Self-hostable.** An RP can run every rpkit component on its own infrastructure, using only a World Chain RPC endpoint and the World ID protocol.
+- **Private.** No third party learns about a verification beyond what the protocol requires (§11.1).
 - **Every proof type.** rpkit verifies all World ID proof types, and adding a new one is a contained change.
 - **Safe by default.** Nonce and nullifier uniqueness are built in, not left to the integrator. Unknown inputs are rejected, and every component fails closed.
 - **Language-neutral.** RP backends in any language integrate through HTTP and standard JWTs. Rust services can link the library directly.
@@ -49,7 +51,8 @@ rpkit moves everything an RP needs into one open-source stack the RP runs itself
 | Proof response | A `ProofResponse`: what the authenticator returns. |
 | Proof type | The `proof_type` of a request: `uniqueness`, `session` or `embedding_similarity` today. |
 | Nonce | A random value the RP puts in each request. It MUST be accepted at most once. |
-| Nullifier | A value derived from the user and the RP's action. The same person always produces the same nullifier for the same action. |
+| Nullifier | In a `uniqueness` proof, a value derived from the user and the RP's action: the same person always produces the same nullifier for the same action. In a `session` proof, a one-time value bound to a random per-proof action. |
+| Session id | A stable, RP-scoped identifier for a user's session. `session` proofs show that the same person is still behind it. |
 | Bridge | The encrypted relay that carries requests and responses between the RP's frontend and the user's authenticator. |
 | Transaction | One proof request and its lifecycle inside rpkit (§7). |
 
@@ -126,9 +129,17 @@ For each response, rpkit runs these steps in order and stops at the first failur
 2. **Freshness.** The request has not expired (`expires_at`).
 3. **Type-specific verification.** The verifier for the request's `proof_type` checks the proof (§5.3).
 4. **Nonce.** The request's nonce is consumed atomically (§7.2). A nonce that was already consumed rejects the proof.
-5. **Nullifier.** Each nullifier is recorded under `(rp_id, action, nullifier)`, unique (§7.3). A nullifier already recorded rejects the proof as `nullifier_reused`.
+5. **Nullifier.** If the proof type produces nullifiers, each one is recorded, unique (§7.3). A nullifier already recorded rejects the proof as `nullifier_reused`.
 
 The nonce is consumed after the proof check, so an invalid proof cannot burn a legitimate request.
+
+What the nullifier step means depends on the proof type:
+
+| Proof type | Nullifier | What uniqueness protects against |
+|---|---|---|
+| `uniqueness` | Per user and action | The same person acting twice under one action |
+| `session` | Session nullifier, one-time | Replay of a session proof; the stable user handle is the `session_id` |
+| `embedding_similarity` | None | Not applicable; replay is covered by the nonce |
 
 ### 5.3 Proof types
 
@@ -139,6 +150,8 @@ The nonce is consumed after the proof check, so an invalid proof cannot burn a l
 | `embedding_similarity` | Off-chain, through [`world-id-rp`](https://github.com/worldcoin/world-id-protocol/tree/main/crates/rp) (WIP-202) | The Flamingo Verifier's Nitro attestation and its key; accepted engine configurations; proof recency; Merkle root and issuer key, both checked on-chain; the AAT policy; the proof itself |
 
 `eth_call` is free and touches no state, so on-chain verification costs the RP nothing beyond RPC usage.
+
+For `embedding_similarity`, the RP stays responsible for one thing rpkit cannot check: the challenge image behind the request's `challenge_hash` must be the image the RP checked against the person it is dealing with. rpkit takes `challenge_hash` as an input when the transaction is created.
 
 Some credentials need checks beyond the proof itself. Integrity bundles for selfie credentials are one example. These run as **credential plugins** that the verifier calls for the matching `issuer_schema_id`.
 
@@ -225,7 +238,6 @@ In service mode each proof request is a transaction:
 | `request` | The signed `ProofRequest`. |
 | `nonce` | The request's nonce. |
 | `bridge_key` | The symmetric key that encrypts the bridge payload. |
-| `browser_binding` | A value tying the transaction to the browser session that started it. |
 | `status` | `created` → `completed` or `failed` or `expired`. |
 | `response_code` | One-time code the RP backend exchanges for the result. |
 | `result` | The verified result or the failure class. |
@@ -251,13 +263,19 @@ pub trait NonceStore: Send + Sync {
 ```rust
 #[async_trait]
 pub trait NullifierStore: Send + Sync {
-    /// Records `nullifier`. Returns `AlreadyRecorded` if it exists for `(rp_id, action)`.
-    async fn record(&self, rp_id: RpId, action: FieldElement, nullifier: FieldElement)
+    /// Records `nullifier`. Returns `AlreadyRecorded` if it exists for `(rp_id, scope)`.
+    async fn record(&self, rp_id: RpId, scope: NullifierScope, nullifier: FieldElement)
         -> Result<Recorded, StoreError>;
 }
 ```
 
-Nullifiers are kept for as long as the action is in use. A reused nullifier is always a rejection: `nullifier_reused` is a terminal error, never a success with a warning.
+`NullifierScope` is the action for `uniqueness` proofs and the session id for `session` proofs.
+
+Retention:
+- `uniqueness` nullifiers are kept for as long as the action is in use.
+- Session nullifiers can be dropped once the request that carried them has expired.
+
+A reused nullifier is always a rejection: `nullifier_reused` is a terminal error, never a success with a warning.
 
 ### 7.4 Backends
 
@@ -273,7 +291,7 @@ Every backend passes the same conformance test suite.
 
 **Who is asking.** The on-chain `RpRegistry` binds `rp_id` to a signer key, a manager key and a domain. Registration is permissionless and pays a registration fee.
 
-At startup, `rpkit-server` MAY register the configured RP itself. Registration is idempotent: rpkit checks the registry first and only registers if the entry is missing. After registration, the protocol generates the RP's OPRF key asynchronously. Until that key exists, proofs fail. rpkit reports itself not ready during this time.
+At startup, `rpkit-server` MAY register the configured RP itself. Registration is idempotent: rpkit checks the registry first and only registers if the entry is missing. After registration, the protocol generates the RP's OPRF key asynchronously. Until that key exists, proofs fail, so rpkit reports that RP as degraded (§13) and rejects its transactions.
 
 **What the user sees.** The consent screen in World App shows the RP's name, logo and action description. Today World App reads these from the Developer Portal. The protocol is moving to a domain-verified metadata record:
 
@@ -290,7 +308,7 @@ rpkit will serve and publish that record once the format is specified. Until the
 2. The widget encrypts the request with AES-256-GCM and posts it to the bridge, which returns a request id.
 3. The widget shows a QR code or deep link containing the request id and the key.
 4. The authenticator fetches the request, asks the user for consent, generates the proof, and puts the encrypted response on the bridge.
-5. The widget polls the bridge, decrypts the response and submits it to rpkit together with `tx_id` and its browser binding.
+5. The widget polls the bridge, decrypts the response and submits it to rpkit with the `tx_id`.
 6. rpkit verifies the proof (§5) and returns a one-time `response_code`.
 7. The RP backend exchanges the `response_code` for the signed result.
 
@@ -313,7 +331,7 @@ sequenceDiagram
   A->>A: consent, generate proof
   A->>BR: encrypted response
   U->>BR: poll, then decrypt
-  U->>S: response + tx_id + browser binding
+  U->>S: response + tx_id
   S->>C: chain checks (eth_call)
   S->>S: type checks, consume nonce, record nullifier
   S-->>U: response_code
@@ -322,7 +340,9 @@ sequenceDiagram
   S-->>B: signed result JWT
 ```
 
-The result only reaches the RP backend through the code exchange, so a page that tampers with the browser cannot fake a result. Binding the code to the browser session that started the transaction blocks session-swap phishing, where an attacker gets a victim to complete the attacker's transaction. This follows the `response_code` pattern of [OpenID4VP 1.0](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html) and [HAIP](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html).
+The result only reaches the RP backend through the code exchange, so a page that tampers with the browser cannot fake a result.
+
+The RP backend MUST link each `tx_id` to the user session that created it, and accept an exchanged result only within that session. This blocks session-swap phishing, where an attacker gets a victim to complete the attacker's transaction. This follows the `response_code` pattern of [OpenID4VP 1.0](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html) and [HAIP](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html).
 
 ### 9.2 Same device
 
@@ -356,7 +376,7 @@ Public. It receives the response from the widget (`POST /v1/tx/{id}/response`) a
 
 On success the exchange returns a JWT signed with ES256:
 
-- **Claims:** `iss`, `aud` (the RP), `iat`, `exp`, `tx_id`, `rp_id`, `proof_type`, `action`, and per response item `issuer_schema_id`, `nullifier` and `session_id` where present.
+- **Claims:** `iss`, `aud` (the RP), `iat`, `exp`, `tx_id`, `rp_id`, `proof_type`, `action` where present, `session_id` where present, and per response item `issuer_schema_id` and `nullifier` where the proof type has one.
 - **Keys:** published at `/.well-known/jwks.json`. A new key is added before use, the newest key signs, and an old key is retired after the longest token lifetime has passed.
 - **Webhooks:** optional. Delivered as signed webhooks (id, timestamp and HMAC). Receivers must deduplicate on the id.
 
@@ -367,11 +387,26 @@ Errors have a stable `code` and a class:
 | Class | HTTP | Meaning | Retry? |
 |---|---|---|---|
 | `invalid` | 422 | The proof or request is rejected: `proof_invalid`, `request_expired`, `nonce_reused`, `nullifier_reused`, `policy_rejected`, `unknown_proof_type`. | No |
+| `rp_degraded` | 503 | The RP cannot take proofs right now: `oprf_key_pending`, `billing_capacity_exhausted`. | After the cause is fixed |
 | `pending` | 409 | The transaction is not finished yet. | Yes |
 | `unavailable` | 503 | A dependency failed: RPC, store or KMS. | Yes, with backoff |
 | `bad_request` | 400 | Malformed input. | No |
 
-## 11. Security considerations
+## 11. Security and privacy considerations
+
+### 11.1 Privacy
+
+What each outside party learns from a verification:
+
+| Party | What it sees |
+|---|---|
+| TFH / Developer Portal | Nothing on the verification path. The portal only serves consent metadata until the domain-verified record is supported (§15). |
+| World Chain RPC provider | The `eth_call` inputs: `rp_id`, nullifier, action, nonce, signal hash and timing. Run your own World Chain node, or use a provider you trust with this. |
+| Bridge operator | Encrypted payloads, request ids, timing and client IP addresses. |
+
+rpkit sends no telemetry to anyone. Its metrics and logs never contain nullifiers, signals or session ids.
+
+### 11.2 Security
 
 - **Fail closed.** Unknown proof types, empty policies, unreachable dependencies and store errors all reject. The default configuration exposes nothing publicly and enables no development backends.
 - **Replay.**
@@ -399,7 +434,7 @@ rpkit's billing client:
 
 - tops up capacity with a `maxWld` slippage limit
 - exposes remaining capacity as a metric
-- reports not ready when a billed RP's capacity is exhausted, because its proofs would fail.
+- marks a billed RP as degraded when its capacity is exhausted: transactions for that RP fail fast with `billing_capacity_exhausted`, and the other RPs on the server are unaffected.
 
 A fork of rpkit cannot skip fees, so rpkit needs no license enforcement and stays fully open source.
 
@@ -407,7 +442,8 @@ A fork of rpkit cannot skip fees, so rpkit needs no license enforcement and stay
 
 - **Health** (admin port):
   - `/health`: the process is alive.
-  - `/ready`: policy loaded; store, RPC and KMS reachable; OPRF key present; billing capacity available for billed RPs. Any of these failing makes the server not ready.
+  - `/ready`: policy loaded; store, RPC and KMS reachable. Any of these failing makes the server not ready.
+  - **Per-RP status**, also on the admin port: OPRF key present and billing capacity available. A degraded RP does not affect other RPs on the same server, and its degraded state is exposed as a metric for alerting.
 - **Timeouts and retries.** Every remote call has a deadline. Only idempotent calls (`eth_call`, reads) are retried, at most twice, with exponential backoff and jitter. Inbound requests have a concurrency limit and are shed with 503 under overload.
 - **Metrics** (DogStatsD/OTLP):
   - verifications by proof type and outcome
