@@ -129,17 +129,9 @@ For each response, rpkit runs these steps in order and stops at the first failur
 2. **Freshness.** The request has not expired (`expires_at`).
 3. **Type-specific verification.** The verifier for the request's `proof_type` checks the proof (§5.3).
 4. **Nonce.** The request's nonce is consumed atomically (§7.2). A nonce that was already consumed rejects the proof.
-5. **Nullifier.** If the proof type produces nullifiers, each one is recorded, unique (§7.3). A nullifier already recorded rejects the proof as `nullifier_reused`.
+5. **Nullifier.** If the proof type produces nullifiers, each one is recorded under its scope (§7.3); `embedding_similarity` produces none. A nullifier already recorded rejects the proof as `nullifier_reused`.
 
 The nonce is consumed after the proof check, so an invalid proof cannot burn a legitimate request.
-
-What the nullifier step means depends on the proof type:
-
-| Proof type | Nullifier | What uniqueness protects against |
-|---|---|---|
-| `uniqueness` | Per user and action | The same person acting twice under one action |
-| `session` | Session nullifier, one-time | Replay of a session proof; the stable user handle is the `session_id` |
-| `embedding_similarity` | None | Not applicable; replay is covered by the nonce |
 
 ### 5.3 Proof types
 
